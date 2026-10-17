@@ -70,8 +70,8 @@ export type {
 /** Plugin identity for cordis.yml rows. */
 export const name = 'dsh-better-sidebar'
 
-/** Services required before mounting: the webserver routes, the session store, the web runtime's trusted hosts, and the tool registry. */
-export const inject = ['webServer', 'sessions', 'webRuntime', 'tools']
+/** Services required before mounting: the webserver routes, the session store, and the tool registry. */
+export const inject = ['webServer', 'sessions', 'tools']
 
 /** Content types for the media route, by extension. */
 const MEDIA_TYPES: Record<string, string> = {
@@ -694,9 +694,16 @@ export function apply(ctx: Context, config?: SidebarConfig): void {
   const resolved = resolveSidebarConfig(config)
   // The web runtime's bind-derived trust list (boot-sampled LAN literals
   // plus --trusted-host authorities) — the authoritative source the /api
-  // gateway fence derives its list from. Read per request from the live
-  // service value; a replaced list takes effect without a plugin restart.
-  const fence = (req: SidebarHttpRequest): boolean => isTrustedApiRequest(req, ctx.webRuntime.trustedHosts)
+  // gateway fence derives its list from. Compatible with DSH 0.2.x (webStartup)
+  // and DSH 0.1.x (webRuntime).
+  let trustedHosts: string[] = []
+  ctx.inject(['webStartup'], (wctx: any) => {
+    trustedHosts = wctx.webStartup?.trustedHosts ?? []
+  })
+  ctx.inject(['webRuntime'], (wctx: any) => {
+    trustedHosts = wctx.webRuntime?.trustedHosts ?? []
+  })
+  const fence = (req: SidebarHttpRequest): boolean => isTrustedApiRequest(req, trustedHosts)
   // The model-facing open-request registry: queues `sidebar_open` requests
   // per session and pushes them to connected sidebar views over the
   // `/sidebar/ws/agent-opens` socket.
