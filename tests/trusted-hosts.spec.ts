@@ -54,18 +54,22 @@ function req(
   } as unknown as IncomingMessage
 }
 
-/** Mount apply() against a fake context with a replaceable webRuntime trust list. */
-function mount(initialTrustedHosts: readonly string[] = []): {
+/** Mount apply() against a fake context with a replaceable webRuntime/webStartup trust list. */
+function mount(
+  initialTrustedHosts: readonly string[] = [],
+  serviceName: 'webRuntime' | 'webStartup' | 'none' = 'webRuntime',
+): {
   api: (r: IncomingMessage, s: ServerResponse) => Promise<void>
   setTrustedHosts: (hosts: readonly string[]) => void
   cleanup: () => void
 } {
-  const runtime = { trustedHosts: [...initialTrustedHosts] }
+  const service = { trustedHosts: [...initialTrustedHosts] }
   const routes: SidebarWebRoute[] = []
   const upgrades: SidebarWebUpgradeRoute[] = []
   const effects: Array<() => void | (() => void)> = []
-  const ctx = {
-    webRuntime: runtime,
+  const injectCallbacks: Array<{ deps: readonly string[]; cb: (wctx: unknown) => void }> = []
+
+  const ctx: Record<string, unknown> = {
     webServer: {
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (route: SidebarWebUpgradeRoute) => { upgrades.push(route); return () => {} },
@@ -76,17 +80,36 @@ function mount(initialTrustedHosts: readonly string[] = []): {
       const cleanup = fn()
       if (typeof cleanup === 'function') effects.push(cleanup)
     },
-    inject: () => () => {},
+    inject: (deps: readonly string[], cb: (wctx: unknown) => void) => {
+      injectCallbacks.push({ deps, cb })
+      if (serviceName !== 'none' && deps.includes(serviceName)) {
+        cb(ctx)
+      }
+      return () => {}
+    },
     // The session/agent event feeds: nothing emits in these tests.
     on: () => () => {},
     get: () => undefined,
   }
+  if (serviceName !== 'none') {
+    ctx[serviceName] = service
+  }
+
   apply(ctx as never)
   const api = routes.find(route => route.path === '/sidebar/api')?.handler
   if (api === undefined) throw new Error('test setup: /sidebar/api route not registered')
   return {
     api: api as (r: IncomingMessage, s: ServerResponse) => Promise<void>,
-    setTrustedHosts: (hosts) => { runtime.trustedHosts = [...hosts] },
+    setTrustedHosts: (hosts) => {
+      service.trustedHosts = [...hosts]
+      if (serviceName !== 'none') {
+        for (const { deps, cb } of injectCallbacks) {
+          if (deps.includes(serviceName)) {
+            cb(ctx)
+          }
+        }
+      }
+    },
     cleanup: () => { for (const cleanup of effects) cleanup() },
   }
 }
@@ -227,6 +250,62 @@ describe('remote-access trust (webRuntime.trustedHosts)', () => {
       const after = fakeRes()
       await api(remoteDomainRequest(), after as unknown as ServerResponse)
       expect(after.status).toBe(200)
+    } finally {
+      cleanup()
+    }
+  })
+})
+
+describe('remote-access trust (DSH 0.2.x webStartup.trustedHosts)', () => {
+  it('accepts a reverse-proxy domain configured in webStartup.trustedHosts', async () => {
+    const { api, cleanup } = mount(['example.com'], 'webStartup')
+    try {
+      const res = fakeRes()
+      await api(remoteDomainRequest(), res as unknown as ServerResponse)
+      expect(res.status).toBe(200)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('accepts LAN IP literals from webStartup.trustedHosts', async () => {
+    const { api, cleanup } = mount(['192.0.2.1'], 'webStartup')
+    try {
+      const res = fakeRes()
+      await api(lanRequest(), res as unknown as ServerResponse)
+      expect(res.status).toBe(200)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('reads webStartup.trustedHosts per request / dynamically on update', async () => {
+    const { api, setTrustedHosts, cleanup } = mount([], 'webStartup')
+    try {
+      const before = fakeRes()
+      await api(remoteDomainRequest(), before as unknown as ServerResponse)
+      expect(before.status).toBe(403)
+      setTrustedHosts(['example.com'])
+      const after = fakeRes()
+      await api(remoteDomainRequest(), after as unknown as ServerResponse)
+      expect(after.status).toBe(200)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('stays loopback-only when neither webStartup nor webRuntime is present', async () => {
+    const { api, cleanup } = mount([], 'none')
+    try {
+      const remote = fakeRes()
+      await api(remoteDomainRequest(), remote as unknown as ServerResponse)
+      expect(remote.status).toBe(403)
+      const loopback = fakeRes()
+      await api(req('POST', '/sidebar/api/session.cwd', {
+        host: '127.0.0.1:3080',
+        'sec-fetch-site': 'same-origin',
+      }, '{"sessionId":"test-session"}'), loopback as unknown as ServerResponse)
+      expect(loopback.status).toBe(200)
     } finally {
       cleanup()
     }
